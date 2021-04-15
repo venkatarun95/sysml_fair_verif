@@ -1,7 +1,7 @@
 from utils import model_to_dict
 
 import matplotlib.pyplot as plt
-from z3 import If, Real, Solver
+from z3 import And, If, Implies, Not, Real, Solver
 
 '''# A node's local view
 
@@ -9,11 +9,12 @@ A node goes through the following phases. Training (Tr) -> Summing (Su) ->
 Broadcast (Br). The compute times for these are C_tr, C_su and 0
 respectively. The model parameters have size P bytes.
 
-In the summing phase, it sends and receives in N blocks of size P/N, where N is
-the number of nodes. The nodes are arranged in a ring which determines who
-sends blocks to whom. It can send the first block as soon as training is done,
-but sending every subsequent block is contingent on receiving the previous
-block C_su seconds ago and having finished transmitting the last block.
+In the summing phase, it sends and receives in N blocks of size B. The size of
+the model is B * N bytes, where N is the number of nodes. The nodes are
+arranged in a ring which determines who sends blocks to whom. It can send the
+first block as soon as training is done, but sending every subsequent block is
+contingent on receiving the previous block C_su seconds ago and having finished
+transmitting the last block.
 
 When a node receives its last block, it moves into the broadcast phase. Here,
 each node has one block which it wants to broadcast to everybody. Blocks go in
@@ -26,10 +27,15 @@ it can begin the training phase of the next iterations
 # Number of nodes
 N = 4
 # Number of iterations (S stands for steps)
-S = 10
+S = 5
+# Number of timesteps we compute cross-traffic over
+T = 10
 
 C_tr = Real("C_tr")
 C_su = Real("C_su")
+B = Real("B")
+# Link rate. Units are arbitrary
+C = 1
 
 # The time at which the s^th iteration's training starts
 tr = [[Real(f"tr_{n},{s}") for s in range(S)] for n in range(N)]
@@ -50,9 +56,19 @@ su_tx = [[[Real(f"su_tx_{n},{s},{i}") for i in range(N)] for s in range(S)] for
 br_tx = [[[Real(f"br_tx_{n},{s},{i}") for i in range(N)] for s in range(S)] for
          n in range(N)]
 
+# Number of our own bytes waiting to be transmitted at the given link
+our_bytes = [[Real("our_bytes_{n},{t}") for t in range(T)] for n in range(N)]
+# Number of competing bytes waiting to be transmitted at the given link
+their_bytes = [[Real("their_bytes_{n},{t}") for t in range(T)] for n in range(N)]
+# Number of bytes competing flows sent
+their_arr = [[Real("their_arr_{n},{t}") for t in range(T)] for n in range(N)]
+
 o = Solver()
 o.add(C_tr > 0)
 o.add(C_su > 0)
+# We don't want time discretization to be too fine. Helps with constraints to
+# determine our_bytes
+o.add(B >= C)
 
 for n in range(N):
     pre = (n - 1) % N
@@ -93,6 +109,40 @@ for n in range(N):
             else:
                 o.add(su_tx[n][s][i] == 1)
                 o.add(br_tx[n][s][i] == 1)
+
+for n in range(N):
+    s.add(our_bytes[n][0] == 0)
+    s.add(their_bytes[n][0] == their_arr[n][0])
+
+    # This is the list of events that occured on this link. We have this for
+    # convenience
+    events = []
+    for s in range(S):
+        events.extend(su[n][s][:-1])
+        events.extend(br[n][s][:-1])
+
+    for t in range(1, T):
+        # Find the latest event between t-1 and t.
+
+        # Temporary variables to compute max
+        max_tmp = [Real(f"max_tmp_{n},{t},{j}") for j in range(len(events))]
+        o.add(max_tmp[0] == events[0])
+        for j in range(1, len(events)):
+            o.add(max_tmp[j] == If(
+                And(events[j] > i-1, events[j] <= i),
+                If(events[j] >= max_tmp[j-1], events[j], max_tmp[j-1]),
+                max_tmp[j-1]))
+
+        # Was there an event in this time interval?
+        found = And(max_tmp[-1] > i-1, max_tmp[-1] <= i)
+
+        # If such an event was found, then our_bytes is determined by that
+        drained = B - (t - max_tmp[-1]) * C
+        s.add(Implies(found, our_bytes[n][t] == If(drained >= 0, drained, 0)))
+        # If not, we continue draining what was there before
+        drained = B - C
+        s.add(Implies(Not(found), our_bytes[n][t] == If(drained >= 0, drained,
+                                                        0)))
 
 sat = o.check()
 print(sat)
