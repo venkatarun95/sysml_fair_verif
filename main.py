@@ -1,7 +1,8 @@
-from utils import model_to_dict
+from utils import ModelDict, model_to_dict
 
 import matplotlib.pyplot as plt
-from z3 import And, If, Implies, Not, Real, Solver
+from typing import Tuple
+from z3 import And, If, Implies, Not, Or, Real, Solver
 
 '''# A node's local view
 
@@ -24,147 +25,160 @@ it can begin the training phase of the next iterations
 
 '''
 
-# Number of nodes
-N = 4
-# Number of iterations (S stands for steps)
-S = 5
-# Number of timesteps we compute cross-traffic over
-T = 10
 
-C_tr = Real("C_tr")
-C_su = Real("C_su")
-B = Real("B")
-# Link rate. Units are arbitrary
-C = 1
+class Config:
+    # Number of nodes
+    N: int = 4
+    # Number of iterations (S stands for steps)
+    S: int = 5
+    # Number of timesteps we compute cross-traffic over
+    T: int = 10
+    # Link rate. Units are arbitrary
+    C: int = 1
 
-# The time at which the s^th iteration's training starts
-tr = [[Real(f"tr_{n},{s}") for s in range(S)] for n in range(N)]
-# The time at which we start trasmitting the i^th block when summing in the
-# s^th iteration. Note, the last sum event is virtual: it doesn't really
-# happen, it merely indicates when the first broadcast started
-su = [[[Real(f"su_{n},{s},{i}") for i in range(N)] for s in range(S)] for
-      n in range(N)]
-# The time at which we start trasmitting the n^th block when broadcasting in
-# the s^th iteration. Similar to su, the last event is virtual
-br = [[[Real(f"br_{n},{s},{i}") for i in range(N)] for s in range(S)] for
-      n in range(N)]
+    def __init__(self):
+        pass
 
-# Transmit time for transmitting during summing
-su_tx = [[[Real(f"su_tx_{n},{s},{i}") for i in range(N)] for s in range(S)] for
-         n in range(N)]
-# Transmit time for transmitting during broadcast
-br_tx = [[[Real(f"br_tx_{n},{s},{i}") for i in range(N)] for s in range(S)] for
-         n in range(N)]
 
-# Number of our own bytes waiting to be transmitted at the given link
-our_bytes = [[Real("our_bytes_{n},{t}") for t in range(T)] for n in range(N)]
-# Number of competing bytes waiting to be transmitted at the given link
-their_bytes = [[Real("their_bytes_{n},{t}") for t in range(T)] for n in range(N)]
-# Number of bytes competing flows sent
-their_arr = [[Real("their_arr_{n},{t}") for t in range(T)] for n in range(N)]
+class Variables:
+    def __init__(self, c: Config):
+        self.C_tr = Real("C_tr")
+        self.C_su = Real("C_su")
+        self.B = Real("B")
 
-o = Solver()
-o.add(C_tr > 0)
-o.add(C_su > 0)
-# We don't want time discretization to be too fine. Helps with constraints to
-# determine our_bytes
-o.add(B >= C)
+        # The time at which the s^th iteration's training starts
+        self.tr = [[Real(f"tr_{n},{s}") for s in range(c.S)] for n in
+                   range(c.N)]
+        # The time at which we start trasmitting the i^th block when summing in
+        # the s^th iteration. Note, the last sum event is virtual: it doesn't
+        # really happen, it merely indicates when the first broadcast started
+        self.su = [[[Real(f"su_{n},{s},{i}") for i in range(c.N)] for s in
+                    range(c.S)] for n in range(c.N)]
+        # The time at which we start trasmitting the n^th block when
+        # broadcasting in the s^th iteration. Similar to su, the last event is
+        # virtual
+        self.br = [[[Real(f"br_{n},{s},{i}") for i in range(c.N)] for s in
+                    range(c.S)] for n in range(c.N)]
 
-for n in range(N):
-    pre = (n - 1) % N
-    nex = (n + 1) % N
-    for s in range(S):
-        if s == 0:
-            o.add(tr[n][s] == 0)
-        else:
-            # Note, the last broadcast is a pseudo-event
-            o.add(tr[n][s] == br[pre][s-1][-1])
+        # Transmit time for transmitting during summing
+        self.su_tx = [[[Real(f"su_tx_{n},{s},{i}") for i in range(c.N)] for s
+                       in range(c.S)] for n in range(c.N)]
+        # Transmit time for transmitting during broadcast
+        self.br_tx = [[[Real(f"br_tx_{n},{s},{i}") for i in range(c.N)] for s
+                       in range(c.S)] for n in range(c.N)]
 
-        # First sum transmit starts after training is done
-        o.add(su[n][s][0] == tr[n][s] + C_tr)
+        # Number of our own bytes waiting to be transmitted at the given link
+        self.our_bytes = [[Real("our_bytes_{n},{t}") for t in range(c.T)] for n
+                          in range(c.N)]
+        # Number of competing bytes waiting to be transmitted at the given link
+        self.their_bytes = [[Real("their_bytes_{n},{t}") for t in range(c.T)]
+                            for n in range(c.N)]
+        # Number of bytes competing flows sent
+        self.their_arr = [[Real("their_arr_{n},{t}") for t in range(c.T)] for n
+                          in range(c.N)]
 
-        # First broadcast happens when the last sum transmit starts because
-        # the last sum transmit is not really needed. It is a pseudo-event
-        o.add(br[n][s][0] == su[n][s][-1])
 
-        for i in range(1, N):
-            # Summing phase:
-            # The next block is ready to be sent
-            ready = su[pre][s][i-1] + su_tx[pre][s][i-1] + C_su
-            # Tx link is clear for sending
-            clear = su[n][s][i-1] + su_tx[n][s][i-1]
-            # When are we sending the next block
-            o.add(su[n][s][i] == If(ready > clear, ready, clear))
-
-            # Broadcast phase: analogous to summing phase
-            ready = br[pre][s][i-1] + br_tx[pre][s][i-1]
-            clear = br[n][s][i-1] + br_tx[n][s][i-1]
-            o.add(br[n][s][i] == If(ready > clear, ready, clear))
-
-        # For now, all transmit times are equal
-        for i in range(N):
-            if n == 0:
-                o.add(su_tx[n][s][i] == 2)
-                o.add(br_tx[n][s][i] == 2)
+def phases(c: Config, o: Solver, v: Variables):
+    ''' Constraints for when the various phases happen for each node '''
+    for n in range(c.N):
+        pre = (n - 1) % c.N
+        nex = (n + 1) % c.N
+        for s in range(c.S):
+            if s == 0:
+                o.add(v.tr[n][s] == 0)
             else:
-                o.add(su_tx[n][s][i] == 1)
-                o.add(br_tx[n][s][i] == 1)
+                # Note, the last broadcast is a pseudo-event
+                o.add(v.tr[n][s] == v.br[pre][s-1][-1])
 
-for n in range(N):
-    s.add(our_bytes[n][0] == 0)
-    s.add(their_bytes[n][0] == their_arr[n][0])
+            # First sum transmit starts after training is done
+            o.add(v.su[n][s][0] == v.tr[n][s] + v.C_tr)
 
-    # This is the list of events that occured on this link. We have this for
-    # convenience
-    events = []
-    for s in range(S):
-        events.extend(su[n][s][:-1])
-        events.extend(br[n][s][:-1])
+            # First broadcast happens when the last sum transmit starts because
+            # the last sum transmit is not really needed. It is a pseudo-event
+            o.add(v.br[n][s][0] == v.su[n][s][-1])
 
-    for t in range(1, T):
-        # Find the latest event between t-1 and t.
+            for i in range(1, c.N):
+                # Summing phase:
+                # The next block is ready to be sent
+                ready = v.su[pre][s][i-1] + v.su_tx[pre][s][i-1] + v.C_su
+                # Tx link is clear for sending
+                clear = v.su[n][s][i-1] + v.su_tx[n][s][i-1]
+                # When are we sending the next block
+                o.add(v.su[n][s][i] == If(ready > clear, ready, clear))
 
-        # Temporary variables to compute max
-        max_tmp = [Real(f"max_tmp_{n},{t},{j}") for j in range(len(events))]
-        o.add(max_tmp[0] == events[0])
-        for j in range(1, len(events)):
-            o.add(max_tmp[j] == If(
-                And(events[j] > i-1, events[j] <= i),
-                If(events[j] >= max_tmp[j-1], events[j], max_tmp[j-1]),
-                max_tmp[j-1]))
+                # Broadcast phase: analogous to summing phase
+                ready = v.br[pre][s][i-1] + v.br_tx[pre][s][i-1]
+                clear = v.br[n][s][i-1] + v.br_tx[n][s][i-1]
+                o.add(v.br[n][s][i] == If(ready > clear, ready, clear))
 
-        # Was there an event in this time interval?
-        found = And(max_tmp[-1] > i-1, max_tmp[-1] <= i)
+            # For now, all except one transmit times are equal
+            for i in range(c.N):
+                if n == 0:
+                    o.add(v.su_tx[n][s][i] == 2)
+                    o.add(v.br_tx[n][s][i] == 2)
+                else:
+                    o.add(v.su_tx[n][s][i] == 1)
+                    o.add(v.br_tx[n][s][i] == 1)
 
-        # If such an event was found, then our_bytes is determined by that
-        drained = B - (t - max_tmp[-1]) * C
-        s.add(Implies(found, our_bytes[n][t] == If(drained >= 0, drained, 0)))
-        # If not, we continue draining what was there before
-        drained = B - C
-        s.add(Implies(Not(found), our_bytes[n][t] == If(drained >= 0, drained,
-                                                        0)))
 
-sat = o.check()
-print(sat)
-if str(sat) == "sat":
-    m = model_to_dict(o.model())
+def tx_times(c: Config, o: Solver, v: Variables):
+    ''' Figure out transmit times based on fair sharing policy '''
+    for n in range(c.N):
+        o.add(v.our_bytes[n][0] == 0)
+        o.add(v.their_bytes[n][0] == v.their_arr[n][0])
+
+        # This is the list of events that occured on this link. We have this for
+        # convenience. Each event is a time instant where a flow started
+        events = []
+        for s in range(c.S):
+            events.extend(v.su[n][s][:-1])
+            events.extend(v.br[n][s][:-1])
+
+        for t in range(1, c.T):
+            # Figure out when flows active at time t-1 end
+            s.add(Implies(v.their_bytes[t-1] > v.our_bytes[t-1]))
+
+            # Find whether there was an event between t-1 and t (there can only
+            # one such event)
+            found = Or(*[And(e > t-1, e <= t) for e in events])
+            # If one was there, find out when it started
+            start_time = Real(f"our_start_time_{n},{t}")
+            for e in events:
+                o.add(Implies(And(e > t-1, e <= t), start_time == e))
+
+
+def make_solver(c: Config) -> Tuple[Solver, Variables]:
+    v = Variables(c)
+    o = Solver()
+    o.add(v.C_tr > 0)
+    o.add(v.C_su > 0)
+    # We don't want time discretization to be too fine. Helps with constraints
+    # to determine our_bytes since we can have only one event per timestep
+    o.add(v.B >= c.C)
+
+    phases(c, o, v)
+
+    return (o, v)
+
+
+def plot_model(m: ModelDict, c: Config):
     ax, fig = plt.subplots()
     args = {
         "linewidth": 8,
         "markersize": 0,
         "solid_capstyle": "butt"
     }
-    for n in range(N):
-        for s in range(S):
+    for n in range(c.N):
+        for s in range(c.S):
             # Plot training
             y = 3 * n + 0.8
             start = m[f"tr_{n},{s}"]
             end = start + m["C_tr"]
             plt.plot([start, end], [y, y], **args, color="black")
 
-            for i in range(N-1):
+            for i in range(c.N-1):
                 # Plot summing
-                y = 3 * n + 1 + i / (N - 1)
+                y = 3 * n + 1 + i / (c.N - 1)
                 start = m[f"su_{n},{s},{i}"]
                 end_1 = start + m[f"su_tx_{n},{s},{i}"]
                 end_2 = end_1 + m["C_tr"]
@@ -172,8 +186,18 @@ if str(sat) == "sat":
                 plt.plot([end_1, end_2], [y, y], **args, color="tomato")
 
                 # Plot broadcast
-                y = 3 * n + 2 + i / (N - 1)
+                y = 3 * n + 2 + i / (c.N - 1)
                 start = m[f"br_{n},{s},{i}"]
                 end = start + m[f"su_tx_{n},{s},{i}"]
                 plt.plot([start, end], [y, y], **args, color="blue")
     plt.show()
+
+
+if __name__ == "__main__":
+    c = Config()
+    o, v = make_solver(c)
+    sat = o.check()
+    print(sat)
+    if str(sat) == "sat":
+        m = model_to_dict(o.model())
+        plot_model(m, c)
