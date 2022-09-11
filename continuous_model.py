@@ -1,5 +1,5 @@
 from pyz3_utils import IfStmt, Max, Min, MySolver, Variables, run_query
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from z3 import And, Implies, Not
 
 '''Each node starts doing backprop. At some arbitrary point in between, and
@@ -18,6 +18,7 @@ class Config(Variables):
     num_timesteps: int = 5
     num_rings: int = 3
     num_nodes_per_ring: int = 3
+    neighbors: List[Tuple[Tuple[int, int], Tuple[int, int]]] = [((0, 0), (1, 0)), ((1, 1), (2, 1))]
 
 class Node(Variables):
     # r and n of my the node with which we share the uplink bottleneck
@@ -117,8 +118,8 @@ def tick(t1: Timestep, t2: Timestep, t2_id: int, c: Config, s: MySolver,
                 s.add(nt2.tot_data_sent == Min(s, nt2.ready_to_send, delta_t))
             else:
                 # Only one of the neighbors needs to do this
-                if r > nt2.neighbor[0] or n > nt2.neighbor[1]:
-                    other = t1.rings[nt2.neighbor[0]].nodes[nt2.neighbor[1]]
+                if r > nt2.neighbor[0]  or (r == nt2.neighbor[0] and n > nt2.neighbor[1]):
+                    other = t2.rings[nt2.neighbor[0]].nodes[nt2.neighbor[1]]
                     # Should we dominate in TCP or should `other` dominate?
                     dom_cond = nt1.sum_sent + nt1.broad_sent\
                         > other.sum_sent + other.broad_sent
@@ -131,6 +132,8 @@ def tick(t1: Timestep, t2: Timestep, t2_id: int, c: Config, s: MySolver,
                         other.tot_data_sent == other.ready_to_send
                     ).Else(
                         nt2.tot_data_sent + other.tot_data_sent == delta_t,
+                        nt2.tot_data_sent <= nt2.ready_to_send,
+                        other.tot_data_sent <= other.ready_to_send,
                         Implies(dom_cond,
                                 nt2.tot_data_sent > other.tot_data_sent),
                         Implies(And(Not(dom_cond), Not(eq_cond)),
@@ -140,32 +143,13 @@ def tick(t1: Timestep, t2: Timestep, t2_id: int, c: Config, s: MySolver,
                     ).add_to_solver(s)
 
 
-def plot(c: Config, v: Variables):
-    print("Format: backprop,sum_sent,broad_sent")
-    print(f"tot_backprop: {[float(x) for x in v.tot_backprop]}, "
-          f"tot_size: {[float(x) for x in v.tot_size]}")
-    for t in range(c.num_timesteps):
-        line = f"{float(v.times[t].time):.2} "
-        for r in range(c.num_rings):
-            line += '\t: '.join(
-                ["{:.2},{:.2},{:.2}".format(
-                    float(n.backprop),
-                    float(n.sum_sent),
-                    float(n.broad_sent))
-                 for n in v.times[t].rings[r].nodes])
-            line += " --- "
-        print(line)
-
-if __name__ == "__main__":
-    c = Config()
-    s = MySolver()
+def make_solver(c: Config, s: MySolver) -> GlobalVars:
     v = GlobalVars(c, s)
 
     # Tell nodes about their neighbors. They are indexed by (ring_id, node_id)
-    neighbors = [((0, 0), (1, 0)), ((1, 1), (2, 1))]
     for t in range(c.num_timesteps):
         for r in range(c.num_rings):
-            for ((r1, n1), (r2, n2)) in neighbors:
+            for ((r1, n1), (r2, n2)) in c.neighbors:
                 v.times[t].rings[r1].nodes[n1].neighbor = (r2, n2)
                 v.times[t].rings[r2].nodes[n2].neighbor = (r1, n1)
 
@@ -177,11 +161,18 @@ if __name__ == "__main__":
     ## Starting time is arbitrary. Set it to something nice
     s.add(v.times[0].time == 0)
     for r in range(c.num_rings):
-        for n in range(c.num_nodes_per_ring):
-            n = v.times[0].rings[r].nodes[n]
+        for nid in range(c.num_nodes_per_ring):
+            n = v.times[0].rings[r].nodes[nid]
+            # Broadcast can only start when sum and backprop is finished
             s.add(Implies(n.broad_sent > 0,
                           And(n.sum_sent == v.tot_size[r],
                               n.backprop == v.tot_backprop[r])))
+
+            # We should not have sent more than we had received
+            s.add(n.sum_sent <= v.times[0].rings[r].nodes[nid-1].sum_sent
+                  + v.tot_size[r] / c.num_nodes_per_ring)
+            s.add(n.broad_sent <= v.times[0].rings[r].nodes[nid-1].broad_sent
+                  + v.tot_size[r] / c.num_nodes_per_ring)
 
     # Basic conditions that hold at all times
     for r in range(c.num_rings):
@@ -195,6 +186,47 @@ if __name__ == "__main__":
                 s.add(n.broad_sent >= 0)
                 s.add(n.sum_sent <= v.tot_size[r])
                 s.add(n.broad_sent <= v.tot_size[r])
+                s.add(n.tot_data_sent >= 0)
+    return v
+
+
+def plot(c: Config, v: Variables):
+    print("Format: backprop,sum_sent,broad_sent")
+    print(f"tot_backprop: {[float(x) for x in v.tot_backprop]}, "
+          f"tot_size: {[float(x) for x in v.tot_size]}")
+    def pprint(n: Node, name: str) -> float:
+        if name in n.__dict__:
+            return float(n.__dict__[name])
+        return -1.0
+    for t in range(c.num_timesteps):
+        line = f"{float(v.times[t].time):.2} "
+        for r in range(c.num_rings):
+            # line += '\t: '.join(
+            #     ["{:.2},{:.2},{:.2}".format(
+            #         float(n.backprop),
+            #         float(n.sum_sent),
+            #         float(n.broad_sent))
+            #         # pprint(n, "tot_data_sent"),
+            #         # pprint(n, "ready_to_send"))
+            #      for n in v.times[t].rings[r].nodes])
+            line += '\t: '.join(
+                [f"{float(n.backprop):.2},"
+                 f"{float(n.sum_sent):.2},"
+                 f"{float(n.broad_sent):.2},"
+                 f"{pprint(n, 'tot_data_sent'):.2},"
+                 f"{pprint(n, 'ready_to_send'):.2}"
+                 for n in v.times[t].rings[r].nodes])
+
+            line += " --- "
+        print(line)
+
+
+if __name__ == "__main__":
+    c = Config()
+    s = MySolver()
+    v = make_solver(c, s)
+    c.num_rings = 2
+    c.neighbors = [((0, 0), (1, 0))]
 
     # Just so the example has nice values
     for r in range(c.num_rings):
