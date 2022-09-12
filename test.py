@@ -16,13 +16,18 @@ class TestContinuousModel(unittest.TestCase):
                 for n in range(c.num_nodes_per_ring):
                     nt1 = v.times[t-1].rings[r].nodes[n]
                     nt2 = v.times[t].rings[r].nodes[n]
-                    cond.append(nt1.backprop > nt2.backprop)
-                    cond.append(nt1.sum_sent > nt2.sum_sent)
-                    cond.append(nt1.broad_sent > nt2.broad_sent)
-                    cond.append(nt2.ready_to_send < 0)
-                    cond.append(nt2.tot_data_sent < 0)
+                    eq = nt1.round == nt2.round
+                    cond.append(nt1.round > nt2.round)
+                    cond.append(And(nt1.backprop > nt2.backprop, eq))
+                    cond.append(And(nt1.sum_sent > nt2.sum_sent, eq))
+                    cond.append(And(nt1.broad_sent > nt2.broad_sent, eq))
+                    cond.append(And(nt2.ready_to_send < 0, eq))
+                    cond.append(And(nt2.tot_data_sent < 0, eq))
         s.add(Or(*cond))
         res = run_query(c, s, v, timeout=60)
+        if res.satisfiable == "sat":
+            from continuous_model import plot
+            plot(res.c, res.v)
         self.assertEqual(res.satisfiable, "unsat")
 
     def test_operation_order(self):
@@ -31,27 +36,30 @@ class TestContinuousModel(unittest.TestCase):
         v = make_solver(c, s)
 
         cond = []
-        for t in range(1, c.num_timesteps):
-            for r in range(c.num_rings):
-                for n in range(c.num_nodes_per_ring):
+        for t in range(1, 3): #c.num_timesteps):
+            for r in range(1): #c.num_rings):
+                for n in range(1): #c.num_nodes_per_ring):
                     nt1 = v.times[t-1].rings[r].nodes[n]
                     nt2 = v.times[t].rings[r].nodes[n]
 
                     # Broadcast can only start if summing is over
-                    cond.append(
-                        And(nt2.broad_sent > nt1.broad_sent,
-                            nt1.sum_sent != v.tot_size[r]))
+                    # cond.append(
+                    #     And(nt2.broad_sent > nt1.broad_sent,
+                    #         nt1.sum_sent != v.tot_size[r]))
 
-                    # We cannot send more data than we have
-                    cond.append(nt2.tot_data_sent > nt2.ready_to_send)
+                    # # We cannot send more data than we have
+                    # cond.append(nt2.tot_data_sent > nt2.ready_to_send)
 
                     # We ought not be sending more sum data than we have
-                    cond.append(nt2.sum_sent >
-                                v.times[t-1].rings[r].nodes[n-1].sum_sent
-                                + v.tot_size[r] / c.num_nodes_per_ring + 0.1)
-                    cond.append(nt2.broad_sent >
-                                v.times[t].rings[r].nodes[n-1].broad_sent
-                                + v.tot_size[r] / c.num_nodes_per_ring)
+                    cond.append(And(
+                        nt2.sum_sent > v.times[t-1].rings[r].nodes[n-1].sum_sent
+                        + v.tot_size[r] / c.num_nodes_per_ring + 0.1,
+                        nt2.round == v.times[t-1].rings[r].nodes[n-1].round))
+                    # cond.append(And(
+                    #     nt2.broad_sent
+                    #     > v.times[t].rings[r].nodes[n-1].broad_sent
+                    #     + v.tot_size[r] / c.num_nodes_per_ring,
+                    #     nt2.round >= v.times[t-1].rings[r].nodes[n-1].round))
 
         s.add(Or(*cond))
 

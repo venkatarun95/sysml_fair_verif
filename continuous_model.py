@@ -1,6 +1,6 @@
 from pyz3_utils import IfStmt, Max, Min, MySolver, Variables, run_query
 from typing import List, Optional, Tuple
-from z3 import And, Implies, Not
+from z3 import And, If, Implies, Not, Or
 
 '''Each node starts doing backprop. At some arbitrary point in between, and
 certainly by the end of backprop, it will have the ability to send its (1/n)^th
@@ -40,6 +40,8 @@ class Node(Variables):
         # The amount of data it actually sent based on bandwidth available
         # (sum_sent + broad_sent) in the time interval leading up to this.
         self.tot_data_sent = s.Real(f"{name}_totDataSent")
+        # Progresses in rounds. This is the round we are currently in
+        self.round = s.Int(f"{name}_round")
 
 
 class Ring(Variables):
@@ -73,25 +75,46 @@ def tick(t1: Timestep, t2: Timestep, t2_id: int, c: Config, s: MySolver,
             nt1 = t1.rings[r].nodes[n]
             nt2 = t2.rings[r].nodes[n]
 
-            # Do backprop if necessary
-            s.add(nt2.backprop ==
+            # Are we done with this round?
+            new_round = And(nt1.backprop == v.tot_backprop[r],
+                            nt1.sum_sent == v.tot_size[r],
+                            nt1.broad_sent == v.tot_size[r])
+
+            IfStmt(new_round,
+                   # Increment round
+                   nt2.round == nt1.round + 1,
+                   # Do backprop
+                   nt2.backprop == Min(s, delta_t, v.tot_backprop[r])
+            ).Else(
+                # Same old, same old
+                nt2.round == nt1.round,
+                # Do backprop
+                nt2.backprop ==
                   Min(s, nt1.backprop + delta_t,
-                      v.tot_backprop[r]))
+                      v.tot_backprop[r])).add_to_solver(s)
 
             # How much do we send for summing?
             ## Cap due to backprop, we'll let z3 pick if backprop is not done
             sum_backprop_cap = s.Real(f"backprop_cap{t2_id},{r},{n}")
-            ### No caps if backprop is not done
+            ### No caps if backprop is done
             s.add(Implies(nt2.backprop >= v.tot_backprop[r],
                   sum_backprop_cap == v.tot_size[r]))
             s.add(sum_backprop_cap >= 0)
 
             ## Cap because of whether or not we received from the previous node
-            sum_recv_cap = Max(s, v.tot_size[r] / c.num_nodes_per_ring,
-                           t1.rings[r].nodes[n-1].sum_sent)
+            sum_recv_cap = v.tot_size[r] / c.num_nodes_per_ring\
+            + If(t1.rings[r].nodes[n-1].round < nt1.round,
+                0,
+                t1.rings[r].nodes[n-1].sum_sent)
 
             # Update ready_to_send, sum_sent and broad_sent
-            IfStmt(
+            IfStmt(new_round,
+                   # No summing or broadcast has started. If z3 wants to sum,
+                   # it can always use one extra timestamp
+                   nt2.sum_sent == 0,
+                   nt2.broad_sent == 0,
+                   nt2.ready_to_send == 0,
+            ).Elif(
                 t1.rings[r].nodes[n].sum_sent < v.tot_size[r],
                 # ^ We are still summing
                 nt2.ready_to_send ==
@@ -160,6 +183,10 @@ def make_solver(c: Config, s: MySolver) -> GlobalVars:
     # Initial conditions
     ## Starting time is arbitrary. Set it to something nice
     s.add(v.times[0].time == 0)
+    ## One starting round per ring is arbitrary. Let it be nice
+    for r in range(c.num_rings):
+        s.add(v.times[t].rings[r].nodes[0].round == 0)
+
     for r in range(c.num_rings):
         for nid in range(c.num_nodes_per_ring):
             n = v.times[0].rings[r].nodes[nid]
@@ -173,6 +200,20 @@ def make_solver(c: Config, s: MySolver) -> GlobalVars:
                   + v.tot_size[r] / c.num_nodes_per_ring)
             s.add(n.broad_sent <= v.times[0].rings[r].nodes[nid-1].broad_sent
                   + v.tot_size[r] / c.num_nodes_per_ring)
+
+            # If the rounds are different:
+            for nid2 in range(c.num_nodes_per_ring):
+                n2 = v.times[0].rings[r].nodes[nid2]
+                s.add(Implies(
+                    n.round != n2.round,
+                    # The difference can be at most 1. We'll take each case at
+                    # a time and assert that we cannot progress farther than
+                    # doing our own backprop and sending our sum
+                    Or(And(n2.round == n.round + 1,
+                           n2.sum_sent <= v.tot_size[r] / c.num_nodes_per_ring),
+                       And(n2.round == n.round - 1,
+                           n.sum_sent <= v.tot_size[r] / c.num_nodes_per_ring),
+                )))
 
     # Basic conditions that hold at all times
     for r in range(c.num_rings):
@@ -191,7 +232,7 @@ def make_solver(c: Config, s: MySolver) -> GlobalVars:
 
 
 def plot(c: Config, v: Variables):
-    print("Format: backprop,sum_sent,broad_sent")
+    print("Format: round,backprop,sum_sent,broad_sent")
     print(f"tot_backprop: {[float(x) for x in v.tot_backprop]}, "
           f"tot_size: {[float(x) for x in v.tot_size]}")
     def pprint(n: Node, name: str) -> float:
@@ -210,7 +251,8 @@ def plot(c: Config, v: Variables):
             #         # pprint(n, "ready_to_send"))
             #      for n in v.times[t].rings[r].nodes])
             line += '\t: '.join(
-                [f"{float(n.backprop):.2},"
+                [f"{int(n.round)},"
+                 f"{float(n.backprop):.2},"
                  f"{float(n.sum_sent):.2},"
                  f"{float(n.broad_sent):.2},"
                  f"{pprint(n, 'tot_data_sent'):.2},"
@@ -246,4 +288,4 @@ if __name__ == "__main__":
         # print(res.model)
         plot(res.c, res.v)
 
-    # print(s.to_smt2())
+    #print(s.to_smt2())
