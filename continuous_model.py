@@ -139,6 +139,11 @@ def tick(t1: Timestep, t2: Timestep, t2_id: int, c: Config, s: MySolver,
             assert nt1 != nt2
             if nt2.neighbor is None:
                 s.add(nt2.tot_data_sent == Min(s, nt2.ready_to_send, delta_t))
+                # This ensures that the timesteps are such that link
+                # utilization is 100% or 0%. Sure we could simplify above due
+                # to this constraint, but meh. Let's keep the flexibility to
+                # enable/disable this for now
+                s.add(nt2.ready_to_send >= delta_t)
             else:
                 # Only one of the neighbors needs to do this
                 if r > nt2.neighbor[0]  or (r == nt2.neighbor[0] and n > nt2.neighbor[1]):
@@ -164,6 +169,11 @@ def tick(t1: Timestep, t2: Timestep, t2_id: int, c: Config, s: MySolver,
                         Implies(eq_cond,
                                 nt2.tot_data_sent == other.tot_data_sent)
                     ).add_to_solver(s)
+
+                    # This ensures that the timesteps are such that link
+                    # utilization is 100% or 0%
+                    s.add(other.ready_to_send + nt2.ready_to_send >= delta_t)
+
 
 
 def make_solver(c: Config, s: MySolver) -> GlobalVars:
@@ -255,8 +265,8 @@ def plot(c: Config, v: Variables):
                  f"{float(n.backprop):.2},"
                  f"{float(n.sum_sent):.2},"
                  f"{float(n.broad_sent):.2},"
-                 f"{pprint(n, 'tot_data_sent'):.2},"
-                 f"{pprint(n, 'ready_to_send'):.2}"
+                 # f"{pprint(n, 'tot_data_sent'):.2},"
+                 # f"{pprint(n, 'ready_to_send'):.2}"
                  for n in v.times[t].rings[r].nodes])
 
             line += " --- "
@@ -266,26 +276,48 @@ def plot(c: Config, v: Variables):
 if __name__ == "__main__":
     c = Config()
     s = MySolver()
-    v = make_solver(c, s)
     c.num_rings = 2
     c.neighbors = [((0, 0), (1, 0))]
+    c.num_timesteps = 2
+    v = make_solver(c, s)
 
-    # Just so the example has nice values
-    for r in range(c.num_rings):
-        s.add(v.tot_size[r] <= 5)
-        s.add(v.tot_backprop[r] <= 5)
+    if True:
+        # Just so the example has nice values
+        for r in range(c.num_rings):
+            s.add(v.tot_size[r] <= 5)
+            s.add(v.tot_backprop[r] <= 5)
 
-    # Just for kicks
-    s.add(v.times[-1].time > 10)
+        # Just for kicks
+        # s.add(v.times[-1].time > 10)
+
+    # Let's ask the big question
+    cond = []
+    for ((r1, n1), (r2, n2)) in c.neighbors:
+        n1i = v.times[0].rings[r1].nodes[n1]
+        n1f = v.times[-1].rings[r1].nodes[n1]
+        n2i = v.times[0].rings[r2].nodes[n2]
+        n2f = v.times[-1].rings[r2].nodes[n2]
+
+        # Overlap in communication increases. This is bad
+        cond.append(And(
+            n1i.sum_sent + n1i.broad_sent > n2i.sum_sent + n2i.broad_sent,
+            n1f.sum_sent + n1f.broad_sent - n1i.sum_sent - n1i.broad_sent <
+            n2f.sum_sent + n2f.broad_sent - n2i.sum_sent - n2i.broad_sent,
+        ))
+        # cond.append(And(
+        #     n1i.sum_sent + n1i.broad_sent > n2i.sum_sent + n2i.broad_sent,
+        #     n1i.sum_sent + n1i.broad_sent - n2i.sum_sent - n2i.broad_sent <
+        #     n1f.sum_sent + n1f.broad_sent - n2f.sum_sent - n2f.broad_sent,
+        # ))
+
+        # There is enough space for communication to fit inside computation
+        s.add(v.tot_size[r1] < v.tot_backprop[r2])
+        s.add(v.tot_size[r2] < v.tot_backprop[r1])
+
+    s.add(Or(*cond))
 
     res = run_query(c, s, v, timeout=3600)
     print(res.satisfiable)
 
     if res.satisfiable == "sat":
-        for k in res.model:
-            if type(res.model[k]) is not bool:
-                pass #print(k, ":::", res.model[k])
-        # print(res.model)
         plot(res.c, res.v)
-
-    #print(s.to_smt2())
