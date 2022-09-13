@@ -4,6 +4,16 @@ import unittest
 from z3 import And, Or
 
 class TestContinuousModel(unittest.TestCase):
+    def test_exists(self):
+        '''If we don't add any fancy constraints, there better exist a
+        solution!'''
+        c = Config()
+        s = MySolver()
+        v = make_solver(c, s)
+        res = run_query(c, s, v, timeout=60)
+        self.assertEqual(res.satisfiable, "sat")
+
+
     def test_monotone(self):
         c = Config()
         s = MySolver()
@@ -43,23 +53,23 @@ class TestContinuousModel(unittest.TestCase):
                     nt2 = v.times[t].rings[r].nodes[n]
 
                     # Broadcast can only start if summing is over
-                    # cond.append(
-                    #     And(nt2.broad_sent > nt1.broad_sent,
-                    #         nt1.sum_sent != v.tot_size[r]))
+                    cond.append(
+                        And(nt2.broad_sent > nt1.broad_sent,
+                            nt1.sum_sent != v.tot_size[r]))
 
-                    # # We cannot send more data than we have
-                    # cond.append(nt2.tot_data_sent > nt2.ready_to_send)
+                    # We cannot send more data than we have
+                    cond.append(nt2.tot_data_sent > nt2.ready_to_send)
 
                     # We ought not be sending more sum data than we have
                     cond.append(And(
                         nt2.sum_sent > v.times[t-1].rings[r].nodes[n-1].sum_sent
                         + v.tot_size[r] / c.num_nodes_per_ring + 0.1,
-                        nt2.round == v.times[t-1].rings[r].nodes[n-1].round))
-                    # cond.append(And(
-                    #     nt2.broad_sent
-                    #     > v.times[t].rings[r].nodes[n-1].broad_sent
-                    #     + v.tot_size[r] / c.num_nodes_per_ring,
-                    #     nt2.round >= v.times[t-1].rings[r].nodes[n-1].round))
+                        nt2.round >= v.times[t-1].rings[r].nodes[n-1].round))
+                    cond.append(And(
+                        nt2.broad_sent
+                        > v.times[t].rings[r].nodes[n-1].broad_sent
+                        + v.tot_size[r] / c.num_nodes_per_ring,
+                        nt2.round >= v.times[t-1].rings[r].nodes[n-1].round))
 
         s.add(Or(*cond))
 
