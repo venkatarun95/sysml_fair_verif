@@ -1,5 +1,9 @@
+import csv
 from pyz3_utils import IfStmt, Max, Min, MySolver, Variables, run_query
 from typing import List, Optional, Tuple
+import z3
+z3.set_option("parallel.threads.max", 4)
+z3.set_option("parallel.enable", "true")
 from z3 import And, If, Implies, Not, Or
 
 '''Each node starts doing backprop. At some arbitrary point in between, and
@@ -18,7 +22,8 @@ class Config(Variables):
     num_timesteps: int = 5
     num_rings: int = 3
     num_nodes_per_ring: int = 3
-    neighbors: List[Tuple[Tuple[int, int], Tuple[int, int]]] = [((0, 0), (1, 0)), ((1, 1), (2, 1))]
+    neighbors: List[Tuple[Tuple[int, int], Tuple[int, int]]] = \
+        [((0, 0), (1, 0)), ((1, 1), (2, 1))]
 
 class Node(Variables):
     # r and n of my the node with which we share the uplink bottleneck
@@ -64,12 +69,13 @@ class GlobalVars(Variables):
         self.times = [Timestep(c, s, f"time{t}") for t in range(c.num_timesteps)]
 
 
-def tick(t1: Timestep, t2: Timestep, t2_id: int, c: Config, s: MySolver,
+def tick(t2_id: int, c: Config, s: MySolver,
          v: GlobalVars):
     ''' Constrain how things evolve in time '''
-    # Assumption is t2 is at a later time than t1
+    assert t2_id > 0
+    t1, t2 = v.times[t2_id-1], v.times[t2_id]
     delta_t = t2.time - t1.time
-    s.add(delta_t > 0)
+    s.add(delta_t >= 0)
     for r in range(c.num_rings):
         for n in range(c.num_nodes_per_ring):
             nt1 = t1.rings[r].nodes[n]
@@ -84,7 +90,9 @@ def tick(t1: Timestep, t2: Timestep, t2_id: int, c: Config, s: MySolver,
                    # Increment round
                    nt2.round == nt1.round + 1,
                    # Do backprop
-                   nt2.backprop == Min(s, delta_t, v.tot_backprop[r])
+                   nt2.backprop == Min(s, delta_t, v.tot_backprop[r]),
+                   # No time has elapsed
+                   t2.time == t1.time,
             ).Else(
                 # Same old, same old
                 nt2.round == nt1.round,
@@ -102,10 +110,15 @@ def tick(t1: Timestep, t2: Timestep, t2_id: int, c: Config, s: MySolver,
             s.add(sum_backprop_cap >= 0)
 
             ## Cap because of whether or not we received from the previous node
+            node_round_diff = t1.rings[r].nodes[n-1].round - nt1.round
             sum_recv_cap = v.tot_size[r] / c.num_nodes_per_ring\
-            + If(t1.rings[r].nodes[n-1].round < nt1.round,
-                0,
-                t1.rings[r].nodes[n-1].sum_sent)
+                + If(node_round_diff > 0, v.tot_size[r],
+                     If(node_round_diff < 0, 0,
+                        t1.rings[r].nodes[n-1].sum_sent))
+            broad_recv_cap = v.tot_size[r] / c.num_nodes_per_ring\
+                + If(node_round_diff > 0, v.tot_size[r],
+                     If(node_round_diff < 0, 0,
+                        t1.rings[r].nodes[n-1].broad_sent))
 
             # Update ready_to_send, sum_sent and broad_sent
             IfStmt(new_round,
@@ -127,9 +140,7 @@ def tick(t1: Timestep, t2: Timestep, t2_id: int, c: Config, s: MySolver,
                 # We are broadcasting
                 nt2.ready_to_send ==
                 Max(s, 0,
-                    Min(s, v.tot_size[r],
-                         t1.rings[r].nodes[n-1].broad_sent
-                        + v.tot_size[r] / c.num_nodes_per_ring)
+                    Min(s, broad_recv_cap, v.tot_size[r])
                     - nt1.broad_sent),
                 nt2.broad_sent == nt1.broad_sent + nt2.tot_data_sent,
                 nt2.sum_sent == nt1.sum_sent
@@ -143,37 +154,51 @@ def tick(t1: Timestep, t2: Timestep, t2_id: int, c: Config, s: MySolver,
                 # utilization is 100% or 0%. Sure we could simplify above due
                 # to this constraint, but meh. Let's keep the flexibility to
                 # enable/disable this for now
-                s.add(nt2.ready_to_send >= delta_t)
+                s.add(Or(nt2.ready_to_send >= delta_t,
+                         nt2.ready_to_send == 0))
             else:
                 # Only one of the neighbors needs to do this
-                if r > nt2.neighbor[0]  or (r == nt2.neighbor[0] and n > nt2.neighbor[1]):
-                    other = t2.rings[nt2.neighbor[0]].nodes[nt2.neighbor[1]]
+                assert r != nt2.neighbor[0]
+                if r > nt2.neighbor[0]: # or (r == nt2.neighbor[0] and n > nt2.neighbor[1]):                    print(t2_id, (r, n), nt2.neighbor, )
+                    oth1 = t1.rings[nt2.neighbor[0]].nodes[nt2.neighbor[1]]
+                    oth2 = t2.rings[nt2.neighbor[0]].nodes[nt2.neighbor[1]]
+
                     # Should we dominate in TCP or should `other` dominate?
                     dom_cond = nt1.sum_sent + nt1.broad_sent\
-                        > other.sum_sent + other.broad_sent
+                        > oth1.sum_sent + oth1.broad_sent
+                    undom_cond = nt1.sum_sent + nt1.broad_sent\
+                        < oth1.sum_sent + oth1.broad_sent
                     # Neither should dominate the other
                     eq_cond = nt1.sum_sent + nt1.broad_sent\
-                        == other.sum_sent + other.broad_sent
+                        == oth1.sum_sent + oth1.broad_sent
                     IfStmt(
-                        nt2.ready_to_send + other.ready_to_send < delta_t,
+                        nt2.ready_to_send + oth2.ready_to_send < delta_t,
                         nt2.tot_data_sent == nt2.ready_to_send,
-                        other.tot_data_sent == other.ready_to_send
+                        oth2.tot_data_sent == oth2.ready_to_send
                     ).Else(
-                        nt2.tot_data_sent + other.tot_data_sent == delta_t,
+                        nt2.tot_data_sent + oth2.tot_data_sent == delta_t,
                         nt2.tot_data_sent <= nt2.ready_to_send,
-                        other.tot_data_sent <= other.ready_to_send,
+                        oth2.tot_data_sent <= oth2.ready_to_send,
                         Implies(dom_cond,
-                                nt2.tot_data_sent > other.tot_data_sent),
-                        Implies(And(Not(dom_cond), Not(eq_cond)),
-                                nt2.tot_data_sent < other.tot_data_sent),
+                                nt2.tot_data_sent > oth2.tot_data_sent),
+                        Implies(undom_cond,
+                                nt2.tot_data_sent < oth2.tot_data_sent),
                         Implies(eq_cond,
-                                nt2.tot_data_sent == other.tot_data_sent)
+                                nt2.tot_data_sent == oth2.tot_data_sent)
                     ).add_to_solver(s)
 
                     # This ensures that the timesteps are such that link
                     # utilization is 100% or 0%
-                    s.add(other.ready_to_send + nt2.ready_to_send >= delta_t)
-
+                    s.add(Or(
+                        oth2.ready_to_send + nt2.ready_to_send >= delta_t,
+                        oth2.ready_to_send + nt2.ready_to_send == 0))
+                    # We can additionally enforce that each sender can
+                    # individually fill up the time. Z3 will be forced to pick
+                    # smaller time gaps if needed
+                    s.add(Or(nt2.ready_to_send >= delta_t,
+                             nt2.ready_to_send == 0))
+                    s.add(Or(oth2.ready_to_send >= delta_t,
+                             oth2.ready_to_send == 0))
 
 
 def make_solver(c: Config, s: MySolver) -> GlobalVars:
@@ -181,14 +206,13 @@ def make_solver(c: Config, s: MySolver) -> GlobalVars:
 
     # Tell nodes about their neighbors. They are indexed by (ring_id, node_id)
     for t in range(c.num_timesteps):
-        for r in range(c.num_rings):
-            for ((r1, n1), (r2, n2)) in c.neighbors:
-                v.times[t].rings[r1].nodes[n1].neighbor = (r2, n2)
-                v.times[t].rings[r2].nodes[n2].neighbor = (r1, n1)
+        for ((r1, n1), (r2, n2)) in c.neighbors:
+            v.times[t].rings[r1].nodes[n1].neighbor = (r2, n2)
+            v.times[t].rings[r2].nodes[n2].neighbor = (r1, n1)
 
     # Do all the ticks
     for t in range(1, c.num_timesteps):
-        tick(v.times[t-1], v.times[t], t, c, s, v)
+        tick(t, c, s, v)
 
     # Initial conditions
     ## Starting time is arbitrary. Set it to something nice
@@ -249,8 +273,11 @@ def plot(c: Config, v: Variables):
         if name in n.__dict__:
             return float(n.__dict__[name])
         return -1.0
+    writer = csv.writer(open("output.csv", "w"))
+
     for t in range(c.num_timesteps):
-        line = f"{float(v.times[t].time):.2} "
+        line = f"{float(v.times[t].time):4.2} "
+        row = [float(v.times[t].time)]
         for r in range(c.num_rings):
             # line += '\t: '.join(
             #     ["{:.2},{:.2},{:.2}".format(
@@ -260,35 +287,46 @@ def plot(c: Config, v: Variables):
             #         # pprint(n, "tot_data_sent"),
             #         # pprint(n, "ready_to_send"))
             #      for n in v.times[t].rings[r].nodes])
-            line += '\t: '.join(
+            line += ' : '.join(
                 [f"{int(n.round)},"
-                 f"{float(n.backprop):.2},"
-                 f"{float(n.sum_sent):.2},"
-                 f"{float(n.broad_sent):.2},"
-                 # f"{pprint(n, 'tot_data_sent'):.2},"
-                 # f"{pprint(n, 'ready_to_send'):.2}"
+                 f"{float(n.backprop):4.2},"
+                 f"{float(n.sum_sent):4.2},"
+                 f"{float(n.broad_sent):4.2},"
+                 f"{pprint(n, 'tot_data_sent'):4.2},"
+                 f"{pprint(n, 'ready_to_send'):4.2}"
                  for n in v.times[t].rings[r].nodes])
 
-            line += " --- "
+            for n in v.times[t].rings[r].nodes:
+                row.extend([
+                    int(n.round),
+                    float(n.backprop),
+                    float(n.sum_sent),
+                    float(n.broad_sent),
+                    pprint(n, "tot_data_sent"),
+                    pprint(n, "ready_to_send"),
+                    "---"])
+            row[-1] += ":---"
         print(line)
+
+        writer.writerow(row)
 
 
 if __name__ == "__main__":
     c = Config()
     s = MySolver()
-    c.num_rings = 2
-    c.neighbors = [((0, 0), (1, 0))]
-    c.num_timesteps = 2
+    # c.num_rings = 2
+    # c.neighbors = [((0, 0), (1, 1))]
+    c.num_nodes_per_ring = 3
+    c.neighbors = [((0, 0), (1, 0)), ((1, 1), (2, 1)), ((2, 2), (0, 2))]
+    c.num_timesteps = 10
+    c.unsat_core = False
     v = make_solver(c, s)
 
-    if True:
+    if False:
         # Just so the example has nice values
         for r in range(c.num_rings):
             s.add(v.tot_size[r] <= 5)
             s.add(v.tot_backprop[r] <= 5)
-
-        # Just for kicks
-        # s.add(v.times[-1].time > 10)
 
     # Let's ask the big question
     cond = []
@@ -301,18 +339,18 @@ if __name__ == "__main__":
         # Overlap in communication increases. This is bad
         cond.append(And(
             n1i.sum_sent + n1i.broad_sent > n2i.sum_sent + n2i.broad_sent,
-            n1f.sum_sent + n1f.broad_sent - n1i.sum_sent - n1i.broad_sent <
-            n2f.sum_sent + n2f.broad_sent - n2i.sum_sent - n2i.broad_sent,
+            sum([v.times[t].rings[r1].nodes[n1].tot_data_sent for t in range(1, c.num_timesteps)]) <
+            sum([v.times[t].rings[r2].nodes[n2].tot_data_sent for t in range(1, c.num_timesteps)])
         ))
-        # cond.append(And(
-        #     n1i.sum_sent + n1i.broad_sent > n2i.sum_sent + n2i.broad_sent,
-        #     n1i.sum_sent + n1i.broad_sent - n2i.sum_sent - n2i.broad_sent <
-        #     n1f.sum_sent + n1f.broad_sent - n2f.sum_sent - n2f.broad_sent,
-        # ))
+        cond.append(And(
+            n1i.sum_sent + n1i.broad_sent < n2i.sum_sent + n2i.broad_sent,
+            sum([v.times[t].rings[r1].nodes[n1].tot_data_sent for t in range(1, c.num_timesteps)]) >
+            sum([v.times[t].rings[r2].nodes[n2].tot_data_sent for t in range(1, c.num_timesteps)])
+        ))
 
         # There is enough space for communication to fit inside computation
-        s.add(v.tot_size[r1] < v.tot_backprop[r2])
-        s.add(v.tot_size[r2] < v.tot_backprop[r1])
+        s.add(2 * v.tot_size[r1] < v.tot_backprop[r2])
+        s.add(2 * v.tot_size[r2] < v.tot_backprop[r1])
 
     s.add(Or(*cond))
 

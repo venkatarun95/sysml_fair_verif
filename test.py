@@ -46,9 +46,9 @@ class TestContinuousModel(unittest.TestCase):
         v = make_solver(c, s)
 
         cond = []
-        for t in range(1, 3): #c.num_timesteps):
-            for r in range(1): #c.num_rings):
-                for n in range(1): #c.num_nodes_per_ring):
+        for t in range(1, c.num_timesteps):
+            for r in range(c.num_rings):
+                for n in range(c.num_nodes_per_ring):
                     nt1 = v.times[t-1].rings[r].nodes[n]
                     nt2 = v.times[t].rings[r].nodes[n]
 
@@ -63,11 +63,11 @@ class TestContinuousModel(unittest.TestCase):
                     # We ought not be sending more sum data than we have
                     cond.append(And(
                         nt2.sum_sent > v.times[t-1].rings[r].nodes[n-1].sum_sent
-                        + v.tot_size[r] / c.num_nodes_per_ring + 0.1,
+                        + v.tot_size[r] / c.num_nodes_per_ring,
                         nt2.round >= v.times[t-1].rings[r].nodes[n-1].round))
                     cond.append(And(
                         nt2.broad_sent
-                        > v.times[t].rings[r].nodes[n-1].broad_sent
+                        > v.times[t-1].rings[r].nodes[n-1].broad_sent
                         + v.tot_size[r] / c.num_nodes_per_ring,
                         nt2.round >= v.times[t-1].rings[r].nodes[n-1].round))
 
