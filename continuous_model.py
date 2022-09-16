@@ -311,15 +311,8 @@ def plot(c: Config, v: Variables):
         writer.writerow(row)
 
 
-if __name__ == "__main__":
-    c = Config()
+def verify_sudarsanan_is_genius(c: Config):
     s = MySolver()
-    # c.num_rings = 2
-    # c.neighbors = [((0, 0), (1, 1))]
-    c.num_nodes_per_ring = 3
-    c.neighbors = [((0, 0), (1, 0)), ((1, 1), (2, 1)), ((2, 2), (0, 2))]
-    c.num_timesteps = 10
-    c.unsat_core = False
     v = make_solver(c, s)
 
     if False:
@@ -349,8 +342,8 @@ if __name__ == "__main__":
         ))
 
         # There is enough space for communication to fit inside computation
-        s.add(2 * v.tot_size[r1] < v.tot_backprop[r2])
-        s.add(2 * v.tot_size[r2] < v.tot_backprop[r1])
+        s.add(2 * v.tot_size[r1] > v.tot_backprop[r2])
+        s.add(2 * v.tot_size[r2] > v.tot_backprop[r1])
 
     s.add(Or(*cond))
 
@@ -359,3 +352,57 @@ if __name__ == "__main__":
 
     if res.satisfiable == "sat":
         plot(res.c, res.v)
+
+if __name__ == "__main__":
+    configs = [
+        {
+            "num_rings": 2,
+            "num_nodes_per_ring": 3,
+            "neighbors": [((0, 0), (1, 0))],
+            "num_timesteps": 5,
+        },
+        {
+            "num_rings": 2,
+            "num_nodes_per_ring": 4,
+            "neighbors": [((0, 0), (1, 0))],
+            "num_timesteps": 5,
+        },
+        {
+            "num_rings": 2,
+            "num_nodes_per_ring": 4,
+            "neighbors": [((0, 0), (1, 0)), ((0, 2), (1, 2))],
+            "num_timesteps": 5,
+        },
+        {
+            "num_rings": 3,
+            "num_nodes_per_ring": 3,
+            "neighbors": [((0, 0), (1, 0)), ((1, 1), (2, 1)), ((2, 2), (0, 2))],
+            "num_timesteps": 10,
+        },
+        {
+            "num_rings": 3,
+            "num_nodes_per_ring": 3,
+            "neighbors": [((0, 0), (1, 0)), ((1, 1), (2, 1))],
+            "num_timesteps": 10,
+        },
+        {
+            "num_rings": 4,
+            "num_nodes_per_ring": 3,
+            "neighbors": [((0, 0), (1, 0)), ((1, 1), (2, 1)), ((2, 2), (3, 2))],
+            "num_timesteps": 10,
+        }
+    ]
+
+    for conf in configs:
+        print(conf)
+        c = Config()
+        c.num_rings = conf["num_rings"]
+        c.num_nodes_per_ring = conf["num_nodes_per_ring"]
+        c.neighbors = conf["neighbors"]
+        c.num_timesteps = conf["num_timesteps"]
+        verify_sudarsanan_is_genius(c)
+
+    # c.num_nodes_per_ring = 3
+    # c.neighbors = [((0, 0), (1, 0)), ((1, 1), (2, 1)), ((2, 2), (0, 2))]
+    # c.num_timesteps = 5
+    # c.unsat_core = False
